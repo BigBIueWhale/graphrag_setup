@@ -3,8 +3,8 @@
 A **GraphRAG workspace** where:
 
 * **All LLM “chat” calls** (indexing + query: `local`, `global`, `drift`, `basic`) go to **your local Ollama** serving
-  `nemotron-3-nano:30b-a3b-q4_K_M-220k` at `http://172.17.0.1:11434/v1` via **OpenAI-compatible** `/v1/chat/completions`.
-* **All embeddings** go to **your vLLM OpenAI-compatible server** hosting `nvidia/llama-embed-nemotron-8b` via `/v1/embeddings`.
+  `nemotron-3-nano:30b-a3b-q4_K_M-220k` at `http://172.17.0.1:11434/v1` via **OpenAI-compatible** `/v1/chat/completions`. **Note:** Probably best to use `Mistral Large 3`
+* **All embeddings** go to **your vLLM OpenAI-compatible server** hosting `nvidia/llama-embed-nemotron-8b` via `/v1/embeddings`. **TODO:** need to provide prompt to this embedding model when embedding the query (woth specific prompt that Nvidia trained on).
 * DRIFT is configured for **maximum recall + stability** (high-K, deeper traversal, multiple repeats), while respecting your **single-inference-at-a-time** constraint.
 
 Also: the earlier Gemini doubts about “hallucinated DRIFT YAML keys” are resolvable: GraphRAG’s official YAML schema explicitly defines a `drift_search` section with keys like `drift_k_followups`, `primer_folds`, `primer_llm_max_tokens`, `n_depth`, and `concurrency`.
