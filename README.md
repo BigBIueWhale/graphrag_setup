@@ -165,8 +165,28 @@ graphrag init --root .
 
 ### 3.2 Put your corpus into `./input/`
 
-* Plain text files are ideal.
-* If you have PDFs/HTML, convert to clean text first (GraphRAG quality is extremely sensitive to garbage characters and layout detritus).
+GraphRAG ingests files from `./input/` using an input **loader** selected by `input.file_type`. Out of the box, the supported loaders are:
+
+* **Plain text** (`file_type: text`) — typically `.txt`
+* **CSV** (`file_type: csv`) — typically `.csv` (each row becomes a document)
+* **JSON** (`file_type: json`) — typically `.json` (not JSONL)
+
+**XML is not a built-in input format** here; convert XML → text/CSV/JSON (or pre-build a documents DataFrame via the indexing API) if your source is XML.
+
+#### Text + Markdown
+
+* Plain text files are ideal (`.txt`).
+* Markdown files (`.md`) are also fine (they’re ingested as raw text), but **the default `file_pattern` for text often only matches `.txt`**, so you must include `.md` explicitly in `settings.yml`:
+
+```yaml
+input:
+  file_type: text
+  file_pattern: '.*\.(txt|md)$'
+```
+
+#### Other formats (PDF/HTML/etc.)
+
+* If you have PDFs/HTML, convert to clean text/CSV/JSON first (GraphRAG quality is extremely sensitive to garbage characters and layout detritus).
 
 ---
 
