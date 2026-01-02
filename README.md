@@ -1,17 +1,17 @@
-## Goal state (what you’re building)
+## Goal state (what you're building)
 
 A **GraphRAG workspace** where:
 
-* **All LLM “chat” calls** (indexing + query: `local`, `global`, `drift`, `basic`) go to **your local Ollama** serving
+* **All LLM "chat" calls** (indexing + query: `local`, `global`, `drift`, `basic`) go to **your local Ollama** serving
   `nemotron-3-nano:30b-a3b-q4_K_M-220k` at `http://172.17.0.1:11434/v1` via **OpenAI-compatible** `/v1/chat/completions`. **Note:** Probably best to use `Mistral Large 3`
 * **All embeddings** go to **your vLLM OpenAI-compatible server** hosting `nvidia/llama-embed-nemotron-8b` via `/v1/embeddings`. **TODO:** need to provide prompt to this embedding model when embedding the query (woth specific prompt that Nvidia trained on).
 * DRIFT is configured for **maximum recall + stability** (high-K, deeper traversal, multiple repeats), while respecting your **single-inference-at-a-time** constraint.
 
-Also: the earlier Gemini doubts about “hallucinated DRIFT YAML keys” are resolvable: GraphRAG’s official YAML schema explicitly defines a `drift_search` section with keys like `drift_k_followups`, `primer_folds`, `primer_llm_max_tokens`, `n_depth`, and `concurrency`.
+Also: the earlier Gemini doubts about "hallucinated DRIFT YAML keys" are resolvable: GraphRAG's official YAML schema explicitly defines a `drift_search` section with keys like `drift_k_followups`, `primer_folds`, `primer_llm_max_tokens`, `n_depth`, and `concurrency`.
 
 ---
 
-## 0) Non-negotiable constraints (so it doesn’t explode later)
+## 0) Non-negotiable constraints (so it doesn't explode later)
 
 ### A. OpenAI-compatible endpoints are *real* and required here
 
@@ -20,15 +20,13 @@ Also: the earlier Gemini doubts about “hallucinated DRIFT YAML keys” are res
 
 ### B. Context length is *not* set via OpenAI API
 
-OpenAI-style calls don’t include “context size”; Ollama’s OpenAI-compat docs explicitly note you must set context size in the **model definition (Modelfile/template)** if you need a different context.
-So: GraphRAG must be configured to **stay under** your 220k window by budgeting its internal “max_context_tokens / max_input_length / data_max_tokens” fields (details below).
+OpenAI-style calls don't include "context size"; Ollama's OpenAI-compat docs explicitly note you must set context size in the **model definition (Modelfile/template)** if you need a different context.
+So: GraphRAG must be configured to **stay under** your 220k window by budgeting its internal "max_context_tokens / max_input_length / data_max_tokens" fields (details below).
 
 ### C. You cannot run two GPU requests at once
 
 GraphRAG DRIFT mode provides an explicit `concurrency` knob. Set it to **1**.
-However, **global search map-reduce** may still issue multiple calls depending on implementation; don’t trust it. The robust fix is: **put a single-flight proxy in front of both Ollama + vLLM** so *the whole system* is serialized (one in-flight request total). That guarantees correctness under your “one request at a time” rule regardless of GraphRAG internals.
-
-I’m going to give you that proxy (small, boring, works).
+However, **global search map-reduce** may still issue multiple calls depending on implementation; don't trust it. The robust fix is: **put Ollama Load Balancer in front of Ollama** so *the whole system* is serialized (one in-flight request total). That guarantees correctness under your "one request at a time" rule regardless of GraphRAG internals.
 
 ---
 
@@ -54,13 +52,13 @@ curl http://172.17.0.1:11434/v1/chat/completions \
   }'
 ```
 
-> Why I’m confident about this endpoint shape: Ollama’s OpenAI-compat blog and docs show `/v1/chat/completions` and using `base_url=http://…/v1` with a dummy key.
+> Why I'm confident about this endpoint shape: Ollama's OpenAI-compat blog and docs show `/v1/chat/completions` and using `base_url=http://.../v1` with a dummy key.
 
 ### 1.2 vLLM (embeddings)
 
 Contract:
 
-* **OpenAI base URL:** `http://172.17.0.1:8000/v1` (use port 8000; that’s vLLM’s documented default pattern)
+* **OpenAI base URL:** `http://172.17.0.1:8000/v1` (use port 8000; that's vLLM's documented default pattern)
 * **Embeddings endpoint:** `/v1/embeddings`
 * **Embedding model name:** `nvidia/llama-embed-nemotron-8b`
 
@@ -80,54 +78,50 @@ vLLM explicitly lists `/v1/embeddings` as a supported OpenAI API for embedding m
 
 ---
 
-## 2) Enforce “only one request at a time” (single-flight proxy)
+## 2) Enforce "only one request at a time" (Ollama Load Balancer)
 
-Run this on the same machine that can reach both `172.17.0.1:11434` and `172.17.0.1:8000`.
+Use **Ollama Load Balancer v1.0.3** (https://github.com/BigBIueWhale/ollama_load_balancer/releases/tag/RLS_01_00_03_2025_01_28) to guarantee GraphRAG never overlaps GPU work.
 
-### 2.1 Install
+Run it on your local machine:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install fastapi uvicorn httpx
+./ollama_load_balancer --host 127.0.0.1 --server "http://172.17.0.1:11434=Nemotron Server"
 ```
 
-### 2.2 Proxy (serializes ALL calls)
+**How it enforces single-request-at-a-time:**
 
-Save as `singleflight_openai_proxy.py`:
+- The load balancer listens on `127.0.0.1:11434` (accessible only from your local machine)
+- It forwards requests to your Ollama server at `172.17.0.1:11434` (the Docker-accessible IP)
+- If GraphRAG tries to send multiple requests, the load balancer **immediately refuses** the second request instead of queueing it
+- This guarantees your single-GPU constraint is respected
 
-```python
-import asyncio
-from fastapi import FastAPI, Request, Response
-import httpx
+**Why this is better than a custom proxy:**
 
-# Targets
-OLLAMA_BASE = "http://172.17.0.1:11434"
-VLLM_BASE   = "http://172.17.0.1:8000"
+- Ollama Load Balancer is specifically designed for this use case
+- It provides reliability tracking (marks servers as unreliable if they fail)
+- It's battle-tested and handles edge cases properly
+- No need to maintain custom proxy code
 
-# One in-flight request across BOTH backends
-SEM = asyncio.Semaphore(1)
+**Configuration:**
 
-app = FastAPI()
+Point GraphRAG to the load balancer:
 
-async def _forward(req: Request, target_url: str) -> Response:
-    body = await req.body()
-    headers = dict(req.headers)
-    headers.pop("host", None)
+```yaml
+models:
+  nemotron_chat:
+    type: openai_chat
+    model: nemotron-3-nano:30b-a3b-q4_K_M-220k
+    api_base: http://127.0.0.1:11434/v1
+    api_key: ollama
+```
 
-    async with SEM:
-        async with httpx.AsyncClient(timeout=None) as client:
-            r = await client.request(
-                method=req.method,
-                url=target_url,
-                content=body,
-                headers=headers,
-            )
-    return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
+**Network flow:**
 
-# Ollama OpenAI-compatible routes
-@app.api_route("/ollama/{path:path}", methods=["GET","POST","PUT","PATCH","DELETE"])
-async def ollama(path: str, req: Request):
+- GraphRAG needs to access `127.0.0.1:11434` (where Ollama Load Balancer is running)
+- Ollama Load Balancer forwards requests to `172.17.0.1:11434` (your Ollama server)
+- This creates a clean separation: GraphRAG → Load Balancer (127.0.0.1) → Ollama (172.17.0.1)
+
+The load balancer ensures only one request is processed at a time, respecting your GPU constraint.
     return await _forward(req, f"{OLLAMA_BASE}/{path}")
 
 # vLLM OpenAI-compatible routes
@@ -167,16 +161,16 @@ graphrag init --root .
 
 GraphRAG ingests files from `./input/` using an input **loader** selected by `input.file_type`. Out of the box, the supported loaders are:
 
-* **Plain text** (`file_type: text`) — typically `.txt`
-* **CSV** (`file_type: csv`) — typically `.csv` (each row becomes a document)
-* **JSON** (`file_type: json`) — typically `.json` (not JSONL)
+* **Plain text** (`file_type: text`) --- typically `.txt`
+* **CSV** (`file_type: csv`) --- typically `.csv` (each row becomes a document)
+* **JSON** (`file_type: json`) --- typically `.json` (not JSONL)
 
 **XML is not a built-in input format** here; convert XML → text/CSV/JSON (or pre-build a documents DataFrame via the indexing API) if your source is XML.
 
 #### Text + Markdown
 
 * Plain text files are ideal (`.txt`).
-* Markdown files (`.md`) are also fine (they’re ingested as raw text), but **the default `file_pattern` for text often only matches `.txt`**, so you must include `.md` explicitly in `settings.yml`:
+* Markdown files (`.md`) are also fine (they're ingested as raw text), but **the default `file_pattern` for text often only matches `.txt`**, so you must include `.md` explicitly in `settings.yml`:
 
 ```yaml
 input:
@@ -190,20 +184,20 @@ input:
 
 ---
 
-## 4) **Opinionated “max quality” settings.yml** (Nemotron-only)
+## 4) **Opinionated "max quality" settings.yml** (Nemotron-only)
 
-You will edit only fields that GraphRAG’s schema explicitly defines (so it validates cleanly).
+You will edit only fields that GraphRAG's schema explicitly defines (so it validates cleanly).
 
-### 4.1 Models: route through the proxy (recommended)
+### 4.1 Models: route through the load balancer
 
-Set these in `settings.yml` under your `models:` section (IDs can be any names; I’ll use these consistently):
+Set these in `settings.yml` under your `models:` section (IDs can be any names; I'll use these consistently):
 
 ```yaml
 models:
   nemotron_chat:
     type: openai_chat
     model: nemotron-3-nano:30b-a3b-q4_K_M-220k
-    api_base: http://127.0.0.1:9000/ollama/v1
+    api_base: http://127.0.0.1:11434/v1
     api_key: ollama
     temperature: 0
     max_tokens: 20000
@@ -217,12 +211,12 @@ models:
 
 Why this shape is grounded:
 
-* Ollama’s OpenAI-compat uses `base_url=.../v1` and a dummy key.
+* Ollama's OpenAI-compat uses `base_url=.../v1` and a dummy key.
 * vLLM supports OpenAI-compatible APIs including `/v1/embeddings` for embedding models.
 
 ### 4.2 Community reports: tuned for DRIFT @ high-K
 
-Community reports must be **dense** but not so huge that DRIFT primer can’t fit K=100.
+Community reports must be **dense** but not so huge that DRIFT primer can't fit K=100.
 
 GraphRAG defines:
 
@@ -240,14 +234,14 @@ community_reports:
 
 Rationale:
 
-* With `drift_k_followups: 100`, you cannot safely shove “long essays” ×100 into a 220k window and still have room for the question, instructions, and the model’s own output.
+* With `drift_k_followups: 100`, you cannot safely shove "long essays" ×100 into a 220k window and still have room for the question, instructions, and the model's own output.
 * 1400-token reports are still rich, but the math stays survivable.
 
-(You asked for “no options”, so this is the single tightrope-walk that keeps “K=100” compatible with “220k context”.)
+(You asked for "no options", so this is the single tightrope-walk that keeps "K=100" compatible with "220k context".)
 
-### 4.3 Query configs (the heart of “full quality”)
+### 4.3 Query configs (the heart of "full quality")
 
-GraphRAG’s schema-defined query knobs are here: `local_search`, `global_search`, `drift_search`, `basic_search`.
+GraphRAG's schema-defined query knobs are here: `local_search`, `global_search`, `drift_search`, `basic_search`.
 And GraphRAG CLI supports running these methods via `--method local|global|drift|basic`, plus `--community-level` and `--dynamic-community-selection` for global search.
 
 #### Local search (wide + deep)
@@ -282,9 +276,9 @@ global_search:
 
 Those dynamic selection fields are explicitly part of the schema.
 
-#### DRIFT search (the “full quality” engine)
+#### DRIFT search (the "full quality" engine)
 
-This is the “K=100 stable” build:
+This is the "K=100 stable" build:
 
 ```yaml
 drift_search:
@@ -308,14 +302,14 @@ drift_search:
   local_search_n: 3
   local_search_llm_max_gen_tokens: 12000
 
-  # Reduce phase budgets (non “o-series” models)
+  # Reduce phase budgets (non "o-series" models)
   data_max_tokens: 200000
   reduce_max_tokens: 20000
 ```
 
 Every key above is directly named in the schema.
 
-#### Basic search (baseline “did we miss obvious chunks?”)
+#### Basic search (baseline "did we miss obvious chunks?")
 
 ```yaml
 basic_search:
@@ -334,16 +328,16 @@ Run:
 graphrag index --root .
 ```
 
-What this does: build the entity/relationship graph, community structure, and reports (which DRIFT uses as its “global primer substrate”). DRIFT’s strength is exactly that it can start from community summaries and then drive local follow-ups. That whole mechanism is the reason GraphRAG is not “just cosine similarity.” (DRIFT described conceptually in the GraphRAG ecosystem; and GraphRAG explicitly documents DRIFT configuration and query mode.)
+What this does: build the entity/relationship graph, community structure, and reports (which DRIFT uses as its "global primer substrate"). DRIFT's strength is exactly that it can start from community summaries and then drive local follow-ups. That whole mechanism is the reason GraphRAG is not "just cosine similarity." (DRIFT described conceptually in the GraphRAG ecosystem; and GraphRAG explicitly documents DRIFT configuration and query mode.)
 
 ---
 
-## 6) Run your 5-method “compute-unlimited ensemble” (no user choice)
+## 6) Run your 5-method "compute-unlimited ensemble" (no user choice)
 
-These commands are grounded in GraphRAG’s CLI docs: `--method`, `--community-level`, and `--dynamic-community-selection`.
+These commands are grounded in GraphRAG's CLI docs: `--method`, `--community-level`, and `--dynamic-community-selection`.
 
 ```bash
-QUERY="…your question…"
+QUERY="...your question..."
 
 # 1) DRIFT
 graphrag query --root . --method drift  --query "$QUERY" > out_drift.txt
@@ -364,9 +358,9 @@ graphrag query --root . --method basic --query "$QUERY" > out_basic.txt
 
 ---
 
-## 7) Merge the 5 outputs (your “cross-reference” step), still Nemotron-only
+## 7) Merge the 5 outputs (your "cross-reference" step), still Nemotron-only
 
-You said: “all of the results will then be cross-referenced … to get the best answer regardless of question type.”
+You said: "all of the results will then be cross-referenced ... to get the best answer regardless of question type."
 
 Do that with a final LLM pass that:
 
@@ -409,10 +403,10 @@ print(resp.choices[0].message.content)
 
 ---
 
-## 8) Context-length reality check (why 220k is “enough” for *this* DRIFT build)
+## 8) Context-length reality check (why 220k is "enough" for *this* DRIFT build)
 
 Nemotron 3 Nano is explicitly positioned as a long-context model (the Ollama library listing emphasizes long context and reports 1M context-window variants).
-But GraphRAG DRIFT’s *practical* context usage is dominated by:
+But GraphRAG DRIFT's *practical* context usage is dominated by:
 
 1. **Primer input size**: `drift_k_followups × (community report length)`
 2. **Primer output**: `primer_llm_max_tokens`
@@ -429,22 +423,22 @@ This is exactly why I forced:
 
 ## 9) If anything fails, it will be one of these (and what it *means*)
 
-1. **“Context length exceeded” / truncated outputs**
+1. **"Context length exceeded" / truncated outputs**
 
    * Means your 220k window is real, but your budgets are too tight to the edge.
-   * The fix is not “lower K” (you demanded K=100); the correct fix is: community reports must stay near the 1400 target, because that’s the only lever that reduces the primer payload without sacrificing K.
+   * The fix is not "lower K" (you demanded K=100); the correct fix is: community reports must stay near the 1400 target, because that's the only lever that reduces the primer payload without sacrificing K.
 
 2. **JSON/structure parsing errors during indexing**
 
    * Means Nemotron is emitting extra text when GraphRAG expects strict structure.
-   * The only correct fix (given your “Nemotron-only” rule) is: make sure your Ollama model template respects OpenAI JSON mode / response formatting (Ollama supports JSON mode in OpenAI-compat).
+   * The only correct fix (given your "Nemotron-only" rule) is: make sure your Ollama model template respects OpenAI JSON mode / response formatting (Ollama supports JSON mode in OpenAI-compat).
 
 3. **GPU VRAM spikes / overlapping inference**
 
-   * Means you bypassed the proxy or DRIFT concurrency wasn’t 1.
+   * Means you bypassed the proxy or DRIFT concurrency wasn't 1.
    * DRIFT exposes `concurrency` explicitly; it must remain 1.
    * The proxy guarantees serialization even if other parts parallelize.
 
 ---
 
-If you want, paste your **generated** `settings.yml` after `graphrag init` (the whole file). I’ll rewrite it into the final “Nemotron-only, 220k-aware, single-flight” version while keeping every key strictly schema-valid.
+If you want, paste your **generated** `settings.yml` after `graphrag init` (the whole file). I'll rewrite it into the final "Nemotron-only, 220k-aware, single-flight" version while keeping every key strictly schema-valid.
